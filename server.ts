@@ -1,6 +1,7 @@
 import 'dotenv/config';
-import express, { Request, Response, NextFunction } from 'express';
-import { verifyFirebaseIdToken, getGoogleServiceAccessToken } from './src/server/platformAuth';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import { verifyFirebaseIdToken, getGoogleServiceAccessToken } from './src/server/platformAuth.js';
 import {
   SHEET_SCHEMAS,
   getSpreadsheetMetadata,
@@ -10,7 +11,7 @@ import {
   appendSheetRow,
   updateSheetRow,
   uploadImageToDrive,
-} from './src/server/googleSheets';
+} from './src/server/googleSheets.js';
 import {
   INITIAL_USERS,
   INITIAL_PRODUCTS,
@@ -21,8 +22,8 @@ import {
   INITIAL_CHALANS,
   INITIAL_BILLS,
   INITIAL_ACTIVITY_LOGS,
-} from './src/server/mockData';
-import {
+} from './src/server/mockData.js';
+import type {
   ProductItem,
   PriceHistoryRecord,
   UserAccessRecord,
@@ -32,7 +33,7 @@ import {
   ChalanRecord,
   BillRecord,
   ActivityLogRecord,
-} from './src/types';
+} from './src/types.js';
 
 
 // Dynamic In-Memory Store (Synchronized with Google Sheets or acting as fast resilient cache)
