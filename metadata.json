@@ -1,0 +1,6 @@
+{
+  "name": "Price Database Management System",
+  "description": "Enterprise price database, quotations, delivery, challan, and bill management with Google Sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
