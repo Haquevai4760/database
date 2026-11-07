@@ -1518,7 +1518,7 @@ async function createApp() {
         base64Data,
         fileName || `product-${Date.now()}.jpg`,
         mimeType || 'image/jpeg',
-        req.accessToken!
+        await getGoogleDriveOAuthAccessToken()
       );
 
       await logActivity(
