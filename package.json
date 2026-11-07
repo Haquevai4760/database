@@ -40,8 +40,7 @@
 <<<<<<< HEAD
     "esbuild": "^0.27.0",
 =======
-    "esbuild": "^0.27.7",
->>>>>>> ad20725 (Fix Vite dependency and build configuration)
+   "esbuild": "^0.27.7",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
