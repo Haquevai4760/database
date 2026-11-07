@@ -33,7 +33,7 @@ import type {
   ChalanRecord,
   BillRecord,
   ActivityLogRecord,
-} from './src/types.js';
+} from './src/types/index.js';
 
 
 // Dynamic In-Memory Store (Synchronized with Google Sheets or acting as fast resilient cache)
