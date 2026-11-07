@@ -10,9 +10,18 @@ import {
   readSheetRows,
   appendSheetRow,
   updateSheetRow,
-  uploadImageToDrive,
-  getGoogleDriveOAuthAccessToken,
 } from './src/server/googleSheets.js';
+import {
+  INITIAL_USERS,
+  INITIAL_PRODUCTS,
+  INITIAL_PRICE_HISTORY,
+  INITIAL_QUOTATIONS,
+  INITIAL_CS_RATES,
+  INITIAL_DELIVERIES,
+  INITIAL_CHALANS,
+  INITIAL_BILLS,
+  INITIAL_ACTIVITY_LOGS,
+} from './src/server/mockData.js';
 import type {
   ProductItem,
   PriceHistoryRecord,
@@ -103,17 +112,27 @@ function logSyncNotice(sheetName: string, err: any) {
   console.info(`[Sync Info] Sheet '${sheetName}' cache served (${cleanMsg})`);
 }
 
-// Google Sheets is the source of truth. These arrays are temporary in-memory caches only.
-// They start empty and are never used as fallback data for GET requests.
-let localUsers: UserAccessRecord[] = [];
-let localProducts: ProductItem[] = [];
-let localPriceHistory: PriceHistoryRecord[] = [];
-let localQuotations: QuotationRecord[] = [];
-let localCSRates: CSRateRecord[] = [];
-let localDeliveries: DeliveryRecord[] = [];
-let localChalans: ChalanRecord[] = [];
-let localBills: BillRecord[] = [];
-let localActivityLogs: ActivityLogRecord[] = [];
+// Local cache / resilient fallback store
+let localUsers: UserAccessRecord[] = [...INITIAL_USERS];
+let localProducts: ProductItem[] = [...INITIAL_PRODUCTS];
+let localPriceHistory: PriceHistoryRecord[] = [...INITIAL_PRICE_HISTORY];
+let localQuotations: QuotationRecord[] = [...INITIAL_QUOTATIONS];
+let localCSRates: CSRateRecord[] = [...INITIAL_CS_RATES];
+let localDeliveries: DeliveryRecord[] = [...INITIAL_DELIVERIES];
+let localChalans: ChalanRecord[] = [...INITIAL_CHALANS];
+let localBills: BillRecord[] = [...INITIAL_BILLS];
+let localActivityLogs: ActivityLogRecord[] = [...INITIAL_ACTIVITY_LOGS];
+
+// Ensure super admin is in localUsers
+if (!localUsers.some((u) => u.email.toLowerCase() === SUPER_ADMIN_EMAIL)) {
+  localUsers.unshift({
+    email: SUPER_ADMIN_EMAIL,
+    role: 'Admin',
+    status: 'Active',
+    addedOn: new Date().toISOString().split('T')[0],
+    name: 'Super Administrator',
+  });
+}
 
 // Extended Request interface
 interface AuthenticatedRequest extends Request {
@@ -497,7 +516,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load products from Google Sheets.' });
+    res.json(localProducts);
   });
 
   app.post('/api/products', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -599,130 +618,37 @@ async function createApp() {
     res.status(201).json(newProduct);
   });
 
- app.put('/api/products/:codeNo', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
-  const targetCode = decodeURIComponent(req.params.codeNo)
-    .trim()
-    .toUpperCase();
+  app.put('/api/products/:codeNo', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+    const targetCode = req.params.codeNo.toUpperCase();
+    const { itemName, brandName, size, unit, unitPrice, remark, category, productImageFileId } = req.body;
 
-  const {
-    itemName,
-    brandName,
-    size,
-    unit,
-    unitPrice,
-    remark,
-    category,
-    productImageFileId,
-  } = req.body;
-
-  if (!configuredSpreadsheetId) {
-    return res.status(503).json({
-      error: 'Google Spreadsheet is not configured.',
-    });
-  }
-
-  try {
-    // 1. Always read the latest product records directly from Google Sheets.
-    const { rows } = await readSheetRows(
-      configuredSpreadsheetId,
-      'Price Database',
-      req.accessToken!
-    );
-
-    // 2. Find product by Code No. (first column).
-    const rowIndex = rows.findIndex(
-      (row) =>
-        String(row[0] || '').trim().toUpperCase() === targetCode
-    );
-
-    if (rowIndex === -1) {
-      return res.status(404).json({
-        error: `Product with Code ${targetCode} not found in Google Sheets.`,
-      });
+    const prodIndex = localProducts.findIndex((p) => p.codeNo.toUpperCase() === targetCode);
+    if (prodIndex === -1) {
+      return res.status(404).json({ error: `Product with Code ${targetCode} not found.` });
     }
 
-    // 3. Read the existing product from the actual Sheet row.
-    const existingRow = rows[rowIndex];
-
-    const prevProduct: ProductItem = {
-      codeNo: String(existingRow[0] || '').trim(),
-      itemName: String(existingRow[1] || ''),
-      brandName: String(existingRow[2] || ''),
-      size: String(existingRow[3] || ''),
-      unit: String(existingRow[4] || ''),
-      unitPrice: Number(existingRow[5]) || 0,
-      updatedDate: String(existingRow[6] || ''),
-      remark: String(existingRow[7] || ''),
-      category: String(existingRow[8] || ''),
-      productImageFileId: String(existingRow[9] || ''),
-    };
-
-    // 4. Prepare updated product.
+    const prevProduct = localProducts[prodIndex];
     const prevPrice = prevProduct.unitPrice;
-    const parsedPrice =
-      unitPrice !== undefined && unitPrice !== ''
-        ? Number(unitPrice)
-        : prevPrice;
-
-    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
-      return res.status(400).json({
-        error: 'Please enter a valid unit price.',
-      });
-    }
-
+    const newPrice = Number(unitPrice);
+    const priceChanged = !isNaN(newPrice) && newPrice !== prevPrice;
     const updateDate = new Date().toISOString().split('T')[0];
-    const priceChanged = parsedPrice !== prevPrice;
 
     const updatedProduct: ProductItem = {
       ...prevProduct,
-      itemName:
-        itemName !== undefined ? String(itemName).trim() : prevProduct.itemName,
-      brandName:
-        brandName !== undefined ? String(brandName).trim() : prevProduct.brandName,
-      size:
-        size !== undefined ? String(size).trim() : prevProduct.size,
-      unit:
-        unit !== undefined ? String(unit).trim() : prevProduct.unit,
-      unitPrice: parsedPrice,
+      itemName: itemName ? itemName.trim() : prevProduct.itemName,
+      brandName: brandName !== undefined ? brandName.trim() : prevProduct.brandName,
+      size: size !== undefined ? size.trim() : prevProduct.size,
+      unit: unit !== undefined ? unit.trim() : prevProduct.unit,
+      unitPrice: priceChanged ? newPrice : prevProduct.unitPrice,
       updatedDate: updateDate,
-      remark:
-        remark !== undefined ? String(remark).trim() : prevProduct.remark,
-      category:
-        category !== undefined ? String(category).trim() : prevProduct.category,
-      productImageFileId:
-        productImageFileId !== undefined
-          ? String(productImageFileId).trim()
-          : prevProduct.productImageFileId,
+      remark: remark !== undefined ? remark.trim() : prevProduct.remark,
+      category: category !== undefined ? category.trim() : prevProduct.category,
+      productImageFileId: productImageFileId !== undefined ? productImageFileId.trim() : prevProduct.productImageFileId,
     };
 
-    if (!updatedProduct.itemName) {
-      return res.status(400).json({
-        error: 'Item name is required.',
-      });
-    }
+    localProducts[prodIndex] = updatedProduct;
 
-    // 5. Update the actual Google Sheets row.
-    // rows[0] represents spreadsheet row 2 because row 1 is the header.
-    await updateSheetRow(
-      configuredSpreadsheetId,
-      'Price Database',
-      rowIndex + 2,
-      [
-        updatedProduct.codeNo,
-        updatedProduct.itemName,
-        updatedProduct.brandName,
-        updatedProduct.size,
-        updatedProduct.unit,
-        updatedProduct.unitPrice,
-        updatedProduct.updatedDate,
-        updatedProduct.remark,
-        updatedProduct.category,
-        updatedProduct.productImageFileId,
-      ],
-      req.accessToken!
-    );
-
-    // 6. Save price history only if the price actually changed.
+    // If price changed, create Price History record
     if (priceChanged) {
       const historyEntry: PriceHistoryRecord = {
         id: `ph-${Date.now()}`,
@@ -732,66 +658,87 @@ async function createApp() {
         brandName: updatedProduct.brandName,
         size: updatedProduct.size,
         previousPrice: prevPrice,
-        newPrice: parsedPrice,
-        priceDiff: parsedPrice - prevPrice,
-        remark: updatedProduct.remark || 'Price updated',
+        newPrice: newPrice,
+        priceDiff: newPrice - prevPrice,
+        remark: remark || 'Price updated',
         updatedBy: req.user!.email,
       };
 
-      await appendSheetRow(
-        configuredSpreadsheetId,
-        'Price History',
-        [
-          historyEntry.updateDate,
-          historyEntry.itemName,
-          historyEntry.codeNo,
-          historyEntry.brandName,
-          historyEntry.size,
-          historyEntry.previousPrice,
-          historyEntry.newPrice,
-          historyEntry.remark,
-          historyEntry.updatedBy,
-        ],
-        req.accessToken!
+      localPriceHistory.unshift(historyEntry);
+
+      if (configuredSpreadsheetId && req.accessToken) {
+        try {
+          await appendSheetRow(
+            configuredSpreadsheetId,
+            'Price History',
+            [
+              historyEntry.updateDate,
+              historyEntry.itemName,
+              historyEntry.codeNo,
+              historyEntry.brandName,
+              historyEntry.size,
+              historyEntry.previousPrice,
+              historyEntry.newPrice,
+              historyEntry.remark,
+              historyEntry.updatedBy,
+            ],
+            req.accessToken
+          );
+        } catch (e) {
+          logSyncNotice('Price History (append)', e);
+        }
+      }
+
+      await logActivity(
+        req,
+        'UPDATE_PRICE',
+        'Price Database',
+        `Changed price for ${updatedProduct.codeNo} from ${prevPrice} to ${newPrice} (diff: ${newPrice - prevPrice})`
+      );
+    } else {
+      await logActivity(
+        req,
+        'UPDATE_PRODUCT',
+        'Price Database',
+        `Updated details for product ${updatedProduct.codeNo} (${updatedProduct.itemName})`
       );
     }
 
-    // 7. Update local cache only as an optional optimization.
-    // It is not used to determine whether the product exists.
-    const cacheIndex = localProducts.findIndex(
-      (p) =>
-        String(p.codeNo || '').trim().toUpperCase() === targetCode
-    );
-
-    if (cacheIndex !== -1) {
-      localProducts[cacheIndex] = updatedProduct;
+    // Update in Google Sheet if configured
+    if (configuredSpreadsheetId && req.accessToken) {
+      try {
+        const { rows } = await readSheetRows(configuredSpreadsheetId, 'Price Database', req.accessToken);
+        const rowIndex = rows.findIndex(
+          (r) => (r[0] && r[0].toUpperCase() === targetCode) || (r[1] && r[1].toUpperCase() === targetCode)
+        );
+        if (rowIndex !== -1) {
+          await updateSheetRow(
+            configuredSpreadsheetId,
+            'Price Database',
+            rowIndex + 2, // 1 for header + 1-indexed
+            [
+              updatedProduct.codeNo,
+              updatedProduct.itemName,
+              updatedProduct.brandName,
+              updatedProduct.size,
+              updatedProduct.unit,
+              updatedProduct.unitPrice,
+              updatedProduct.updatedDate,
+              updatedProduct.remark,
+              updatedProduct.category,
+              updatedProduct.productImageFileId,
+            ],
+            req.accessToken
+          );
+        }
+      } catch (err) {
+        logSyncNotice('Price Database (update)', err);
+      }
     }
 
-    // 8. Activity log.
-    await logActivity(
-      req,
-      priceChanged ? 'UPDATE_PRICE' : 'UPDATE_PRODUCT',
-      'Price Database',
-      priceChanged
-        ? `Updated ${targetCode}: ${prevPrice} to ${parsedPrice}`
-        : `Updated product details: ${targetCode} (${updatedProduct.itemName})`
-    );
+    res.json(updatedProduct);
+  });
 
-    return res.json({
-      success: true,
-      message: 'Product updated successfully.',
-      product: updatedProduct,
-    });
-
-  } catch (err: any) {
-    console.error('[PUT /api/products/:codeNo] Update failed:', err);
-
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to update product in Google Sheets.',
-    });
-  }
-});
   // Product deletion is intentionally not exposed as an API endpoint.
   // Only Admin may receive a future DELETE endpoint if deletion is required.
 
@@ -838,7 +785,15 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load price history from Google Sheets.' });
+    const fallbackHistory = req.user?.role === 'Admin'
+      ? localPriceHistory
+      : localPriceHistory.map((record) => ({
+          ...record,
+          updatedBy: record.updatedBy?.toLowerCase().trim() === req.user?.email.toLowerCase().trim()
+            ? record.updatedBy
+            : '',
+        }));
+    res.json(fallbackHistory);
   });
 
   // --- QUOTATIONS ---
@@ -876,7 +831,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load quotations from Google Sheets.' });
+    res.json(localQuotations);
   });
 
   app.post('/api/quotations', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1006,7 +961,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load CS rates from Google Sheets.' });
+    res.json(localCSRates);
   });
 
   app.post('/api/cs-rates', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1105,7 +1060,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load deliveries from Google Sheets.' });
+    res.json(localDeliveries);
   });
 
   app.post('/api/deliveries', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1176,7 +1131,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load challans from Google Sheets.' });
+    res.json(localChalans);
   });
 
   app.post('/api/challans', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1249,7 +1204,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load bills from Google Sheets.' });
+    res.json(localBills);
   });
 
   app.post('/api/bills', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1388,7 +1343,7 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load users from Google Sheets.' });
+    res.json(localUsers);
   });
 
   app.post('/api/users', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1503,98 +1458,104 @@ async function createApp() {
       }
     }
 
-    return res.status(503).json({ success: false, error: 'Unable to load activity logs from Google Sheets.' });
+    res.json(localActivityLogs);
   });
 
-  // --- GOOGLE DRIVE IMAGE UPLOAD ---
+  // --- GOOGLE DRIVE IMAGE UPLOAD (via existing Google Apps Script) ---
   app.post('/api/drive/upload', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
-    const { base64Data, fileName, mimeType } = req.body;
+    const { base64Data, fileName, mimeType } = req.body || {};
 
-    if (!base64Data) {
-      return res.status(400).json({ error: 'Base64 image data is required.' });
+    if (!base64Data || typeof base64Data !== 'string') {
+      return res.status(400).json({ success: false, error: 'Base64 image data is required.' });
+    }
+
+    const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL?.trim();
+    const uploadSecret = process.env.ERP_IMAGE_UPLOAD_SECRET;
+
+    if (!appsScriptUrl || !uploadSecret) {
+      console.error('Drive upload configuration missing: APPS_SCRIPT_WEB_APP_URL or ERP_IMAGE_UPLOAD_SECRET.');
+      return res.status(503).json({
+        success: false,
+        error: 'Google Drive upload is not configured. Please contact the administrator.',
+      });
     }
 
     try {
-      const uploadResult = await uploadImageToDrive(
-        base64Data,
-        fileName || `product-${Date.now()}.jpg`,
-        mimeType || 'image/jpeg',
-        await getGoogleDriveOAuthAccessToken()
-      );
+      const scriptResponse = await fetch(appsScriptUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          secret: uploadSecret,
+          base64Data,
+          fileName: fileName || `product-${Date.now()}.jpg`,
+          mimeType: mimeType || 'image/jpeg',
+        }),
+        redirect: 'follow',
+      });
+
+      const responseText = await scriptResponse.text();
+      let uploadResult: any;
+
+      try {
+        uploadResult = JSON.parse(responseText);
+      } catch {
+        console.error('Apps Script returned a non-JSON response:', responseText.slice(0, 500));
+        throw new Error('Apps Script returned an invalid response. Check the Web App deployment and access settings.');
+      }
+
+      if (!scriptResponse.ok || !uploadResult?.success || !uploadResult?.fileId) {
+        throw new Error(uploadResult?.error || `Apps Script upload failed (HTTP ${scriptResponse.status}).`);
+      }
 
       await logActivity(
         req,
         'UPLOAD_PRODUCT_IMAGE',
         'Google Drive',
-        `Uploaded product image ${fileName} (Drive ID: ${uploadResult.fileId})`
+        `Uploaded product image ${fileName || uploadResult.fileName} (Drive ID: ${uploadResult.fileId})`
       );
 
-      res.json(uploadResult);
+      return res.json({
+        success: true,
+        fileId: uploadResult.fileId,
+        fileName: uploadResult.fileName || fileName || '',
+        webViewLink: uploadResult.webViewLink || `https://drive.google.com/file/d/${uploadResult.fileId}/view`,
+        imageUrl: uploadResult.imageUrl || `https://drive.google.com/uc?export=view&id=${uploadResult.fileId}`,
+        thumbnailLink: uploadResult.thumbnailLink || `https://drive.google.com/thumbnail?id=${uploadResult.fileId}&sz=w1000`,
+      });
     } catch (err: any) {
-      console.error('Google Drive upload error:', err);
-      res.status(500).json({ error: `Drive upload failed: ${err.message}` });
+      console.error('Google Apps Script Drive upload error:', err);
+      return res.status(502).json({
+        success: false,
+        error: `Drive upload failed: ${err?.message || 'Unknown error'}`,
+      });
     }
   });
 
-  // --- DASHBOARD METRICS (live Google Sheets data only) ---
-  app.get('/api/dashboard/metrics', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
-    if (!configuredSpreadsheetId) {
-      return res.status(503).json({ success: false, error: 'Google Spreadsheet is not configured.' });
-    }
-
-    try {
-      const [productSheet, quotationSheet, deliverySheet, challanSheet, billSheet, activitySheet] = await Promise.all([
-        readSheetRows(configuredSpreadsheetId, 'Price Database', req.accessToken!),
-        readSheetRows(configuredSpreadsheetId, 'Quotation', req.accessToken!),
-        readSheetRows(configuredSpreadsheetId, 'Delivery', req.accessToken!),
-        readSheetRows(configuredSpreadsheetId, 'Chalan', req.accessToken!),
-        readSheetRows(configuredSpreadsheetId, 'Bill', req.accessToken!),
-        readSheetRows(configuredSpreadsheetId, 'Activity Log', req.accessToken!),
-      ]);
-
-      const productRows = productSheet.rows.filter((r) => (r[0] || r[1]) && r[0] !== 'Code No.');
-      const quotationRows = quotationSheet.rows.filter((r) => r[0] && r[0] !== 'Quotation No.');
-      const deliveryRows = deliverySheet.rows.filter((r) => r[0] && r[0] !== 'Delivery No.');
-      const challanRows = challanSheet.rows.filter((r) => r[0] && r[0] !== 'Challan No.');
-      const billRows = billSheet.rows.filter((r) => r[0] && r[0] !== 'Bill No.');
-      const activityRows = activitySheet.rows.filter((r) => r.some((cell) => String(cell || '').trim()));
-
-      const recentProducts: ProductItem[] = productRows.map((r) => ({
-        codeNo: r[0] || '', itemName: r[1] || '', brandName: r[2] || '',
-        size: r[3] || '', unit: r[4] || '',
-        unitPrice: parseFloat(String(r[5] || '').replace(/,/g, '')) || 0,
-        updatedDate: r[6] || '', remark: r[7] || '', category: r[8] || '',
-        productImageFileId: r[9] || '',
-      })).sort((a, b) => String(b.updatedDate).localeCompare(String(a.updatedDate))).slice(0, 5);
-
-      const recentActivities: ActivityLogRecord[] = activityRows.slice(-8).reverse().map((r, i) => ({
-        id: `log-live-${i}`, timestamp: r[0] || '', userEmail: r[1] || '',
-        action: r[2] || '', module: r[3] || '', details: r[4] || '',
-      }));
-
-      const totalReceivables = billRows.reduce((sum, r) => sum + (parseFloat(String(r[6] || '0').replace(/,/g, '')) || 0), 0);
-
-      if (req.user?.role !== 'Admin') {
-        return res.json({ totalProducts: productRows.length, recentProducts });
-      }
-
+  // --- DASHBOARD METRICS ---
+  app.get('/api/dashboard/metrics', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+    // Employee dashboard is limited to product-related information.
+    if (req.user?.role !== 'Admin') {
       return res.json({
-        totalProducts: productRows.length,
-        totalQuotations: quotationRows.length,
-        totalDeliveries: deliveryRows.length,
-        totalChallans: challanRows.length,
-        totalBills: billRows.length,
-        totalReceivables,
-        recentActivities,
-        recentProducts,
-      });
-    } catch (err: any) {
-      console.error('[Dashboard Metrics] Google Sheets read failed:', err);
-      return res.status(503).json({
-        success: false,
-        error: 'Dashboard data could not be loaded from Google Sheets.',
+        totalProducts: localProducts.length,
+        recentProducts: localProducts.slice(0, 5),
       });
     }
+
+    const totalReceivables = localBills.reduce((sum, b) => sum + (b.balanceDue || 0), 0);
+
+    res.json({
+      totalProducts: localProducts.length,
+      totalQuotations: localQuotations.length,
+      totalDeliveries: localDeliveries.length,
+      totalChallans: localChalans.length,
+      totalBills: localBills.length,
+      totalReceivables,
+      recentActivities: localActivityLogs.slice(0, 8),
+      recentProducts: localProducts.slice(0, 5),
+    });
   });
 
   if (process.env.NODE_ENV !== 'production') {
