@@ -598,37 +598,130 @@ async function createApp() {
     res.status(201).json(newProduct);
   });
 
-  app.put('/api/products/:codeNo', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
-    const targetCode = req.params.codeNo.toUpperCase();
-    const { itemName, brandName, size, unit, unitPrice, remark, category, productImageFileId } = req.body;
+ app.put('/api/products/:codeNo', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  const targetCode = decodeURIComponent(req.params.codeNo)
+    .trim()
+    .toUpperCase();
 
-    const prodIndex = localProducts.findIndex((p) => p.codeNo.toUpperCase() === targetCode);
-    if (prodIndex === -1) {
-      return res.status(404).json({ error: `Product with Code ${targetCode} not found.` });
+  const {
+    itemName,
+    brandName,
+    size,
+    unit,
+    unitPrice,
+    remark,
+    category,
+    productImageFileId,
+  } = req.body;
+
+  if (!configuredSpreadsheetId) {
+    return res.status(503).json({
+      error: 'Google Spreadsheet is not configured.',
+    });
+  }
+
+  try {
+    // 1. Always read the latest product records directly from Google Sheets.
+    const { rows } = await readSheetRows(
+      configuredSpreadsheetId,
+      'Price Database',
+      req.accessToken!
+    );
+
+    // 2. Find product by Code No. (first column).
+    const rowIndex = rows.findIndex(
+      (row) =>
+        String(row[0] || '').trim().toUpperCase() === targetCode
+    );
+
+    if (rowIndex === -1) {
+      return res.status(404).json({
+        error: `Product with Code ${targetCode} not found in Google Sheets.`,
+      });
     }
 
-    const prevProduct = localProducts[prodIndex];
+    // 3. Read the existing product from the actual Sheet row.
+    const existingRow = rows[rowIndex];
+
+    const prevProduct: ProductItem = {
+      codeNo: String(existingRow[0] || '').trim(),
+      itemName: String(existingRow[1] || ''),
+      brandName: String(existingRow[2] || ''),
+      size: String(existingRow[3] || ''),
+      unit: String(existingRow[4] || ''),
+      unitPrice: Number(existingRow[5]) || 0,
+      updatedDate: String(existingRow[6] || ''),
+      remark: String(existingRow[7] || ''),
+      category: String(existingRow[8] || ''),
+      productImageFileId: String(existingRow[9] || ''),
+    };
+
+    // 4. Prepare updated product.
     const prevPrice = prevProduct.unitPrice;
-    const newPrice = Number(unitPrice);
-    const priceChanged = !isNaN(newPrice) && newPrice !== prevPrice;
+    const parsedPrice =
+      unitPrice !== undefined && unitPrice !== ''
+        ? Number(unitPrice)
+        : prevPrice;
+
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+      return res.status(400).json({
+        error: 'Please enter a valid unit price.',
+      });
+    }
+
     const updateDate = new Date().toISOString().split('T')[0];
+    const priceChanged = parsedPrice !== prevPrice;
 
     const updatedProduct: ProductItem = {
       ...prevProduct,
-      itemName: itemName ? itemName.trim() : prevProduct.itemName,
-      brandName: brandName !== undefined ? brandName.trim() : prevProduct.brandName,
-      size: size !== undefined ? size.trim() : prevProduct.size,
-      unit: unit !== undefined ? unit.trim() : prevProduct.unit,
-      unitPrice: priceChanged ? newPrice : prevProduct.unitPrice,
+      itemName:
+        itemName !== undefined ? String(itemName).trim() : prevProduct.itemName,
+      brandName:
+        brandName !== undefined ? String(brandName).trim() : prevProduct.brandName,
+      size:
+        size !== undefined ? String(size).trim() : prevProduct.size,
+      unit:
+        unit !== undefined ? String(unit).trim() : prevProduct.unit,
+      unitPrice: parsedPrice,
       updatedDate: updateDate,
-      remark: remark !== undefined ? remark.trim() : prevProduct.remark,
-      category: category !== undefined ? category.trim() : prevProduct.category,
-      productImageFileId: productImageFileId !== undefined ? productImageFileId.trim() : prevProduct.productImageFileId,
+      remark:
+        remark !== undefined ? String(remark).trim() : prevProduct.remark,
+      category:
+        category !== undefined ? String(category).trim() : prevProduct.category,
+      productImageFileId:
+        productImageFileId !== undefined
+          ? String(productImageFileId).trim()
+          : prevProduct.productImageFileId,
     };
 
-    localProducts[prodIndex] = updatedProduct;
+    if (!updatedProduct.itemName) {
+      return res.status(400).json({
+        error: 'Item name is required.',
+      });
+    }
 
-    // If price changed, create Price History record
+    // 5. Update the actual Google Sheets row.
+    // rows[0] represents spreadsheet row 2 because row 1 is the header.
+    await updateSheetRow(
+      configuredSpreadsheetId,
+      'Price Database',
+      rowIndex + 2,
+      [
+        updatedProduct.codeNo,
+        updatedProduct.itemName,
+        updatedProduct.brandName,
+        updatedProduct.size,
+        updatedProduct.unit,
+        updatedProduct.unitPrice,
+        updatedProduct.updatedDate,
+        updatedProduct.remark,
+        updatedProduct.category,
+        updatedProduct.productImageFileId,
+      ],
+      req.accessToken!
+    );
+
+    // 6. Save price history only if the price actually changed.
     if (priceChanged) {
       const historyEntry: PriceHistoryRecord = {
         id: `ph-${Date.now()}`,
@@ -638,87 +731,66 @@ async function createApp() {
         brandName: updatedProduct.brandName,
         size: updatedProduct.size,
         previousPrice: prevPrice,
-        newPrice: newPrice,
-        priceDiff: newPrice - prevPrice,
-        remark: remark || 'Price updated',
+        newPrice: parsedPrice,
+        priceDiff: parsedPrice - prevPrice,
+        remark: updatedProduct.remark || 'Price updated',
         updatedBy: req.user!.email,
       };
 
-      localPriceHistory.unshift(historyEntry);
-
-      if (configuredSpreadsheetId && req.accessToken) {
-        try {
-          await appendSheetRow(
-            configuredSpreadsheetId,
-            'Price History',
-            [
-              historyEntry.updateDate,
-              historyEntry.itemName,
-              historyEntry.codeNo,
-              historyEntry.brandName,
-              historyEntry.size,
-              historyEntry.previousPrice,
-              historyEntry.newPrice,
-              historyEntry.remark,
-              historyEntry.updatedBy,
-            ],
-            req.accessToken
-          );
-        } catch (e) {
-          logSyncNotice('Price History (append)', e);
-        }
-      }
-
-      await logActivity(
-        req,
-        'UPDATE_PRICE',
-        'Price Database',
-        `Changed price for ${updatedProduct.codeNo} from ${prevPrice} to ${newPrice} (diff: ${newPrice - prevPrice})`
-      );
-    } else {
-      await logActivity(
-        req,
-        'UPDATE_PRODUCT',
-        'Price Database',
-        `Updated details for product ${updatedProduct.codeNo} (${updatedProduct.itemName})`
+      await appendSheetRow(
+        configuredSpreadsheetId,
+        'Price History',
+        [
+          historyEntry.updateDate,
+          historyEntry.itemName,
+          historyEntry.codeNo,
+          historyEntry.brandName,
+          historyEntry.size,
+          historyEntry.previousPrice,
+          historyEntry.newPrice,
+          historyEntry.remark,
+          historyEntry.updatedBy,
+        ],
+        req.accessToken!
       );
     }
 
-    // Update in Google Sheet if configured
-    if (configuredSpreadsheetId && req.accessToken) {
-      try {
-        const { rows } = await readSheetRows(configuredSpreadsheetId, 'Price Database', req.accessToken);
-        const rowIndex = rows.findIndex(
-          (r) => (r[0] && r[0].toUpperCase() === targetCode) || (r[1] && r[1].toUpperCase() === targetCode)
-        );
-        if (rowIndex !== -1) {
-          await updateSheetRow(
-            configuredSpreadsheetId,
-            'Price Database',
-            rowIndex + 2, // 1 for header + 1-indexed
-            [
-              updatedProduct.codeNo,
-              updatedProduct.itemName,
-              updatedProduct.brandName,
-              updatedProduct.size,
-              updatedProduct.unit,
-              updatedProduct.unitPrice,
-              updatedProduct.updatedDate,
-              updatedProduct.remark,
-              updatedProduct.category,
-              updatedProduct.productImageFileId,
-            ],
-            req.accessToken
-          );
-        }
-      } catch (err) {
-        logSyncNotice('Price Database (update)', err);
-      }
+    // 7. Update local cache only as an optional optimization.
+    // It is not used to determine whether the product exists.
+    const cacheIndex = localProducts.findIndex(
+      (p) =>
+        String(p.codeNo || '').trim().toUpperCase() === targetCode
+    );
+
+    if (cacheIndex !== -1) {
+      localProducts[cacheIndex] = updatedProduct;
     }
 
-    res.json(updatedProduct);
-  });
+    // 8. Activity log.
+    await logActivity(
+      req,
+      priceChanged ? 'UPDATE_PRICE' : 'UPDATE_PRODUCT',
+      'Price Database',
+      priceChanged
+        ? `Updated ${targetCode}: ${prevPrice} to ${parsedPrice}`
+        : `Updated product details: ${targetCode} (${updatedProduct.itemName})`
+    );
 
+    return res.json({
+      success: true,
+      message: 'Product updated successfully.',
+      product: updatedProduct,
+    });
+
+  } catch (err: any) {
+    console.error('[PUT /api/products/:codeNo] Update failed:', err);
+
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to update product in Google Sheets.',
+    });
+  }
+});
   // Product deletion is intentionally not exposed as an API endpoint.
   // Only Admin may receive a future DELETE endpoint if deletion is required.
 
