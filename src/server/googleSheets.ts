@@ -401,6 +401,42 @@ export async function updateSheetRow(
 }
 
 /**
+ * Get a short-lived Google Drive access token using the user's OAuth refresh token.
+ * Separate from the Service Account token used for Google Sheets.
+ */
+export async function getGoogleDriveOAuthAccessToken(): Promise<string> {
+  const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GOOGLE_DRIVE_CLIENT_SECRET?.trim();
+  const refreshToken = process.env.GOOGLE_DRIVE_REFRESH_TOKEN?.trim();
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error(
+      'Google Drive OAuth is not configured. Set GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET and GOOGLE_DRIVE_REFRESH_TOKEN in Vercel.'
+    );
+  }
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Google Drive OAuth token refresh failed: ${details.slice(0, 500)}`);
+  }
+
+  const data = await response.json() as { access_token?: string };
+  if (!data.access_token) throw new Error('Google Drive OAuth did not return an access token.');
+  return data.access_token;
+}
+
+/**
  * Upload an image file directly to Google Drive via multipart upload
  */
 export async function uploadImageToDrive(
