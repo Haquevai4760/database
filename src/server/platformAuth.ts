@@ -1,5 +1,6 @@
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
 import { GoogleAuth } from 'google-auth-library';
 
 type ServiceAccount = {
@@ -10,22 +11,42 @@ type ServiceAccount = {
 };
 
 function readServiceAccount(): ServiceAccount {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const raw =
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
   if (!raw) {
     throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable.');
   }
+
   const parsed = JSON.parse(raw) as ServiceAccount;
-  if (parsed.private_key) parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+
+  if (parsed.private_key) {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+  }
+
   return parsed;
 }
 
-function getAdminAuth() {
+function getFirebaseAdminApp() {
+  const existingApp = getApps().find((app) => app.name === '[DEFAULT]');
+
+  if (existingApp) return existingApp;
+
   const account = readServiceAccount();
-  const app = getApps()[0] || initializeApp({
+
+  return initializeApp({
     credential: cert(account as any),
     projectId: process.env.FIREBASE_PROJECT_ID || account.project_id,
   });
-  return getAuth(app);
+}
+
+export function getAdminAuth() {
+  return getAuth(getFirebaseAdminApp());
+}
+
+export function getAdminFirestore() {
+  return getFirestore(getFirebaseAdminApp());
 }
 
 export async function verifyFirebaseIdToken(idToken: string) {
@@ -37,6 +58,7 @@ let googleAuthClient: GoogleAuth | null = null;
 export async function getGoogleServiceAccessToken(): Promise<string> {
   if (!googleAuthClient) {
     const credentials = readServiceAccount();
+
     googleAuthClient = new GoogleAuth({
       credentials,
       scopes: [
@@ -49,6 +71,10 @@ export async function getGoogleServiceAccessToken(): Promise<string> {
   const client = await googleAuthClient.getClient();
   const result = await client.getAccessToken();
   const token = typeof result === 'string' ? result : result.token;
-  if (!token) throw new Error('Could not obtain Google service account access token.');
+
+  if (!token) {
+    throw new Error('Could not obtain Google service account access token.');
+  }
+
   return token;
 }
