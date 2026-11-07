@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { verifyFirebaseIdToken, getGoogleServiceAccessToken } from './src/server/platformAuth.js';
+import { verifyFirebaseIdToken, getGoogleServiceAccessToken, getAdminFirestore } from './src/server/platformAuth.js';
 import {
   SHEET_SCHEMAS,
   getSpreadsheetMetadata,
@@ -36,10 +36,76 @@ import type {
 } from './src/types/index.js';
 
 
-// Dynamic In-Memory Store (Synchronized with Google Sheets or acting as fast resilient cache)
+// Spreadsheet configuration: Firestore is the persistent source of truth.
+// SPREADSHEET_ID remains a fallback for the first deployment / Firestore outage.
 const DEFAULT_SPREADSHEET_ID = '12xd8lipwlIOIAs64biRDHy4NZO8K6_FhURYd1bWGU4';
-let configuredSpreadsheetId = process.env.SPREADSHEET_ID?.trim() || DEFAULT_SPREADSHEET_ID;
-const SUPER_ADMIN_EMAIL = (process.env.SUPER_ADMIN_EMAIL || 'nhaque4760@gmail.com').toLowerCase().trim();
+let configuredSpreadsheetId =
+  process.env.SPREADSHEET_ID?.trim() || DEFAULT_SPREADSHEET_ID;
+
+const SUPER_ADMIN_EMAIL = (
+  process.env.SUPER_ADMIN_EMAIL || 'nhaque4760@gmail.com'
+).toLowerCase().trim();
+
+const SPREADSHEET_CONFIG_COLLECTION = 'app_config';
+const SPREADSHEET_CONFIG_DOCUMENT = 'google_sheets';
+
+function normalizeSpreadsheetId(input: unknown): string {
+  let value = String(input ?? '').trim();
+  if (!value) return '';
+
+  // Accept either a spreadsheet ID or a complete Google Sheets URL.
+  const urlMatch = value.match(/docs\.google\.com\\?\/spreadsheets\\?\/d\\?\/([a-zA-Z0-9_-]+)/i)
+    || value.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/i);
+
+  if (urlMatch?.[1]) value = urlMatch[1];
+
+  // IDs contain only URL-safe characters. Reject accidental pasted text.
+  if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+    throw new Error('Invalid Google Spreadsheet ID or URL.');
+  }
+
+  return value;
+}
+
+async function loadSpreadsheetConfig(): Promise<void> {
+  try {
+    const snapshot = await getAdminFirestore()
+      .collection(SPREADSHEET_CONFIG_COLLECTION)
+      .doc(SPREADSHEET_CONFIG_DOCUMENT)
+      .get();
+
+    const savedId = snapshot.data()?.spreadsheetId;
+    if (typeof savedId === 'string' && savedId.trim()) {
+      configuredSpreadsheetId = normalizeSpreadsheetId(savedId);
+    }
+
+    console.info('[Spreadsheet Config] Persistent configuration loaded.');
+  } catch (error) {
+    // Do not prevent the whole API from starting if Firestore is temporarily unavailable.
+    // The environment/default ID remains as a fallback, but saving new settings will fail.
+    console.error('[Spreadsheet Config] Could not load Firestore configuration:', error);
+  }
+}
+
+async function saveSpreadsheetConfig(id: string, updatedBy: string): Promise<void> {
+  const cleanId = normalizeSpreadsheetId(id);
+  if (!cleanId) throw new Error('Spreadsheet ID cannot be empty.');
+
+  await getAdminFirestore()
+    .collection(SPREADSHEET_CONFIG_COLLECTION)
+    .doc(SPREADSHEET_CONFIG_DOCUMENT)
+    .set(
+      {
+        spreadsheetId: cleanId,
+        updatedBy,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+  // Update this serverless instance only after persistent storage succeeds.
+  configuredSpreadsheetId = cleanId;
+}
 
 function logSyncNotice(sheetName: string, err: any) {
   const msg = err instanceof Error ? err.message : String(err);
@@ -67,11 +133,6 @@ if (!localUsers.some((u) => u.email.toLowerCase() === SUPER_ADMIN_EMAIL)) {
     addedOn: new Date().toISOString().split('T')[0],
     name: 'Super Administrator',
   });
-}
-
-// Vercel instances are ephemeral. Configure SPREADSHEET_ID in Vercel Environment Variables.
-function saveSpreadsheetConfig(id: string) {
-  configuredSpreadsheetId = id.trim();
 }
 
 // Extended Request interface
@@ -123,6 +184,8 @@ async function logActivity(
 }
 
 async function createApp() {
+  await loadSpreadsheetConfig();
+
   const app = express();
 
   app.use(express.json({ limit: '25mb' }));
@@ -307,13 +370,13 @@ async function createApp() {
 
   // Configure existing Spreadsheet ID (Admin only)
   app.post('/api/spreadsheet/configure', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
-    const { spreadsheetId } = req.body;
-    let cleanId = (spreadsheetId || '').trim();
-
-    // If full URL was pasted, extract the sheet ID
-    const match = cleanId.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (match) {
-      cleanId = match[1];
+    let cleanId = '';
+    try {
+      cleanId = normalizeSpreadsheetId(req.body?.spreadsheetId);
+    } catch (error: any) {
+      return res.status(400).json({
+        error: error?.message || 'Please provide a valid Google Spreadsheet ID or URL.',
+      });
     }
 
     if (!cleanId) {
@@ -322,7 +385,7 @@ async function createApp() {
 
     try {
       const metadata = await getSpreadsheetMetadata(cleanId, req.accessToken!);
-      saveSpreadsheetConfig(cleanId);
+      await saveSpreadsheetConfig(cleanId, req.user!.email);
 
       await logActivity(
         req,
@@ -353,7 +416,7 @@ async function createApp() {
     const title = req.body.title || 'Price Database Management System Central Database';
     try {
       const result = await createAndInitializeSpreadsheet(title, req.accessToken!, req.user!.email);
-      saveSpreadsheetConfig(result.spreadsheetId);
+      await saveSpreadsheetConfig(result.spreadsheetId, req.user!.email);
 
       await logActivity(
         req,
