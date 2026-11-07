@@ -12,17 +12,6 @@ import {
   updateSheetRow,
   uploadImageToDrive,
 } from './src/server/googleSheets.js';
-import {
-  INITIAL_USERS,
-  INITIAL_PRODUCTS,
-  INITIAL_PRICE_HISTORY,
-  INITIAL_QUOTATIONS,
-  INITIAL_CS_RATES,
-  INITIAL_DELIVERIES,
-  INITIAL_CHALANS,
-  INITIAL_BILLS,
-  INITIAL_ACTIVITY_LOGS,
-} from './src/server/mockData.js';
 import type {
   ProductItem,
   PriceHistoryRecord,
@@ -113,27 +102,17 @@ function logSyncNotice(sheetName: string, err: any) {
   console.info(`[Sync Info] Sheet '${sheetName}' cache served (${cleanMsg})`);
 }
 
-// Local cache / resilient fallback store
-let localUsers: UserAccessRecord[] = [...INITIAL_USERS];
-let localProducts: ProductItem[] = [...INITIAL_PRODUCTS];
-let localPriceHistory: PriceHistoryRecord[] = [...INITIAL_PRICE_HISTORY];
-let localQuotations: QuotationRecord[] = [...INITIAL_QUOTATIONS];
-let localCSRates: CSRateRecord[] = [...INITIAL_CS_RATES];
-let localDeliveries: DeliveryRecord[] = [...INITIAL_DELIVERIES];
-let localChalans: ChalanRecord[] = [...INITIAL_CHALANS];
-let localBills: BillRecord[] = [...INITIAL_BILLS];
-let localActivityLogs: ActivityLogRecord[] = [...INITIAL_ACTIVITY_LOGS];
-
-// Ensure super admin is in localUsers
-if (!localUsers.some((u) => u.email.toLowerCase() === SUPER_ADMIN_EMAIL)) {
-  localUsers.unshift({
-    email: SUPER_ADMIN_EMAIL,
-    role: 'Admin',
-    status: 'Active',
-    addedOn: new Date().toISOString().split('T')[0],
-    name: 'Super Administrator',
-  });
-}
+// Google Sheets is the source of truth. These arrays are temporary in-memory caches only.
+// They start empty and are never used as fallback data for GET requests.
+let localUsers: UserAccessRecord[] = [];
+let localProducts: ProductItem[] = [];
+let localPriceHistory: PriceHistoryRecord[] = [];
+let localQuotations: QuotationRecord[] = [];
+let localCSRates: CSRateRecord[] = [];
+let localDeliveries: DeliveryRecord[] = [];
+let localChalans: ChalanRecord[] = [];
+let localBills: BillRecord[] = [];
+let localActivityLogs: ActivityLogRecord[] = [];
 
 // Extended Request interface
 interface AuthenticatedRequest extends Request {
@@ -517,7 +496,7 @@ async function createApp() {
       }
     }
 
-    res.json(localProducts);
+    return res.status(503).json({ success: false, error: 'Unable to load products from Google Sheets.' });
   });
 
   app.post('/api/products', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -786,15 +765,7 @@ async function createApp() {
       }
     }
 
-    const fallbackHistory = req.user?.role === 'Admin'
-      ? localPriceHistory
-      : localPriceHistory.map((record) => ({
-          ...record,
-          updatedBy: record.updatedBy?.toLowerCase().trim() === req.user?.email.toLowerCase().trim()
-            ? record.updatedBy
-            : '',
-        }));
-    res.json(fallbackHistory);
+    return res.status(503).json({ success: false, error: 'Unable to load price history from Google Sheets.' });
   });
 
   // --- QUOTATIONS ---
@@ -832,7 +803,7 @@ async function createApp() {
       }
     }
 
-    res.json(localQuotations);
+    return res.status(503).json({ success: false, error: 'Unable to load quotations from Google Sheets.' });
   });
 
   app.post('/api/quotations', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -962,7 +933,7 @@ async function createApp() {
       }
     }
 
-    res.json(localCSRates);
+    return res.status(503).json({ success: false, error: 'Unable to load CS rates from Google Sheets.' });
   });
 
   app.post('/api/cs-rates', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1061,7 +1032,7 @@ async function createApp() {
       }
     }
 
-    res.json(localDeliveries);
+    return res.status(503).json({ success: false, error: 'Unable to load deliveries from Google Sheets.' });
   });
 
   app.post('/api/deliveries', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1132,7 +1103,7 @@ async function createApp() {
       }
     }
 
-    res.json(localChalans);
+    return res.status(503).json({ success: false, error: 'Unable to load challans from Google Sheets.' });
   });
 
   app.post('/api/challans', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1205,7 +1176,7 @@ async function createApp() {
       }
     }
 
-    res.json(localBills);
+    return res.status(503).json({ success: false, error: 'Unable to load bills from Google Sheets.' });
   });
 
   app.post('/api/bills', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1344,7 +1315,7 @@ async function createApp() {
       }
     }
 
-    res.json(localUsers);
+    return res.status(503).json({ success: false, error: 'Unable to load users from Google Sheets.' });
   });
 
   app.post('/api/users', authMiddleware, adminOnlyMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -1459,7 +1430,7 @@ async function createApp() {
       }
     }
 
-    res.json(localActivityLogs);
+    return res.status(503).json({ success: false, error: 'Unable to load activity logs from Google Sheets.' });
   });
 
   // --- GOOGLE DRIVE IMAGE UPLOAD ---
@@ -1492,28 +1463,65 @@ async function createApp() {
     }
   });
 
-  // --- DASHBOARD METRICS ---
-  app.get('/api/dashboard/metrics', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
-    // Employee dashboard is limited to product-related information.
-    if (req.user?.role !== 'Admin') {
-      return res.json({
-        totalProducts: localProducts.length,
-        recentProducts: localProducts.slice(0, 5),
-      });
+  // --- DASHBOARD METRICS (live Google Sheets data only) ---
+  app.get('/api/dashboard/metrics', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+    if (!configuredSpreadsheetId) {
+      return res.status(503).json({ success: false, error: 'Google Spreadsheet is not configured.' });
     }
 
-    const totalReceivables = localBills.reduce((sum, b) => sum + (b.balanceDue || 0), 0);
+    try {
+      const [productSheet, quotationSheet, deliverySheet, challanSheet, billSheet, activitySheet] = await Promise.all([
+        readSheetRows(configuredSpreadsheetId, 'Price Database', req.accessToken!),
+        readSheetRows(configuredSpreadsheetId, 'Quotation', req.accessToken!),
+        readSheetRows(configuredSpreadsheetId, 'Delivery', req.accessToken!),
+        readSheetRows(configuredSpreadsheetId, 'Chalan', req.accessToken!),
+        readSheetRows(configuredSpreadsheetId, 'Bill', req.accessToken!),
+        readSheetRows(configuredSpreadsheetId, 'Activity Log', req.accessToken!),
+      ]);
 
-    res.json({
-      totalProducts: localProducts.length,
-      totalQuotations: localQuotations.length,
-      totalDeliveries: localDeliveries.length,
-      totalChallans: localChalans.length,
-      totalBills: localBills.length,
-      totalReceivables,
-      recentActivities: localActivityLogs.slice(0, 8),
-      recentProducts: localProducts.slice(0, 5),
-    });
+      const productRows = productSheet.rows.filter((r) => (r[0] || r[1]) && r[0] !== 'Code No.');
+      const quotationRows = quotationSheet.rows.filter((r) => r[0] && r[0] !== 'Quotation No.');
+      const deliveryRows = deliverySheet.rows.filter((r) => r[0] && r[0] !== 'Delivery No.');
+      const challanRows = challanSheet.rows.filter((r) => r[0] && r[0] !== 'Challan No.');
+      const billRows = billSheet.rows.filter((r) => r[0] && r[0] !== 'Bill No.');
+      const activityRows = activitySheet.rows.filter((r) => r.some((cell) => String(cell || '').trim()));
+
+      const recentProducts: ProductItem[] = productRows.map((r) => ({
+        codeNo: r[0] || '', itemName: r[1] || '', brandName: r[2] || '',
+        size: r[3] || '', unit: r[4] || '',
+        unitPrice: parseFloat(String(r[5] || '').replace(/,/g, '')) || 0,
+        updatedDate: r[6] || '', remark: r[7] || '', category: r[8] || '',
+        productImageFileId: r[9] || '',
+      })).sort((a, b) => String(b.updatedDate).localeCompare(String(a.updatedDate))).slice(0, 5);
+
+      const recentActivities: ActivityLogRecord[] = activityRows.slice(-8).reverse().map((r, i) => ({
+        id: `log-live-${i}`, timestamp: r[0] || '', userEmail: r[1] || '',
+        action: r[2] || '', module: r[3] || '', details: r[4] || '',
+      }));
+
+      const totalReceivables = billRows.reduce((sum, r) => sum + (parseFloat(String(r[6] || '0').replace(/,/g, '')) || 0), 0);
+
+      if (req.user?.role !== 'Admin') {
+        return res.json({ totalProducts: productRows.length, recentProducts });
+      }
+
+      return res.json({
+        totalProducts: productRows.length,
+        totalQuotations: quotationRows.length,
+        totalDeliveries: deliveryRows.length,
+        totalChallans: challanRows.length,
+        totalBills: billRows.length,
+        totalReceivables,
+        recentActivities,
+        recentProducts,
+      });
+    } catch (err: any) {
+      console.error('[Dashboard Metrics] Google Sheets read failed:', err);
+      return res.status(503).json({
+        success: false,
+        error: 'Dashboard data could not be loaded from Google Sheets.',
+      });
+    }
   });
 
   if (process.env.NODE_ENV !== 'production') {
